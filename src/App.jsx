@@ -73,10 +73,10 @@ async function fetchWithCache(url, cacheKey, ttlMs = 300000) {
   }
 }
 
-// Batch quote fetch — new stable API uses ?symbol= with comma-separated tickers
-async function fetchBulkQuotes(tickers) {
-  const url = `${FMP_BASE}/batch-quote?symbol=${tickers.join(",")}&apikey=${FMP_API_KEY}`;
-  return fetchWithCache(url, "bulk_quotes", 60000);
+// Single quote fetch — free tier compatible
+async function fetchQuote(ticker) {
+  const url = `${FMP_BASE}/quote?symbol=${ticker}&apikey=${FMP_API_KEY}`;
+  return fetchWithCache(url, "quote_" + ticker, 3600000);
 }
 
 // Historical prices — new stable endpoint
@@ -590,65 +590,73 @@ export default function App() {
         setLoadingMsg("Testing API connection...");
         diagLog.push("Key: " + FMP_API_KEY.slice(0, 4) + "***");
 
-        // TIER 1: Use /stable/quote for individual stocks (free tier compatible)
-        // Fetch in groups of 5 with small delays to avoid rate limits
-        // Total: ~20 calls for 100 stocks (5 per call) — well within 250/day
+        // DIRECT SINGLE-STOCK QUOTES (free tier compatible)
+        // /stable/quote?symbol=AAPL works on free plan
+        // /stable/quote?symbol=AAPL,MSFT (multi) returns 402 on free plan
+        // So we fetch one at a time, with localStorage caching (1hr TTL)
+        // First load: ~80 calls. Second load within 1hr: 0 calls.
         const usTickers = TOP_100_TICKERS.filter(t => !t.includes(".TO"));
-        const batchSize = 5;
         const allQuotes = [];
+        let skippedFromCache = 0;
+        let fetchErrors = [];
         
-        for (let i = 0; i < usTickers.length; i += batchSize) {
-          const batch = usTickers.slice(i, i + batchSize);
-          const quoteUrl = `${FMP_BASE}/quote?symbol=${batch.join(",")}&apikey=${FMP_API_KEY}`;
+        setLoadingMsg("Fetching live quotes (0/" + usTickers.length + ")...");
+        
+        for (let i = 0; i < usTickers.length; i++) {
+          const ticker = usTickers[i];
+          
+          // Check localStorage cache first (1 hour TTL)
+          const cached = getCached("quote_" + ticker, 3600000);
+          if (cached) {
+            allQuotes.push(cached);
+            skippedFromCache++;
+            continue;
+          }
           
           try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 10000);
-            const res = await fetch(quoteUrl, { signal: controller.signal });
-            clearTimeout(timeout);
+            const res = await fetch(`${FMP_BASE}/quote?symbol=${ticker}&apikey=${FMP_API_KEY}`);
             
             if (!res.ok) {
-              if (res.status === 402) throw new Error("402: Endpoint requires paid plan — trying single quotes...");
-              throw new Error(`HTTP ${res.status}`);
+              if (res.status === 402) {
+                fetchErrors.push(ticker + ":402");
+                continue; // Skip this ticker, don't burn more calls
+              }
+              fetchErrors.push(ticker + ":" + res.status);
+              continue;
             }
             
             const data = await res.json();
             callsUsed++;
             
-            if (Array.isArray(data)) {
-              allQuotes.push(...data);
-            } else if (data && data.symbol) {
-              allQuotes.push(data);
+            let quoteObj = null;
+            if (Array.isArray(data) && data.length > 0) quoteObj = data[0];
+            else if (data && data.symbol) quoteObj = data;
+            
+            if (quoteObj && quoteObj.price > 0) {
+              allQuotes.push(quoteObj);
+              setCache("quote_" + ticker, quoteObj); // Cache for 1hr
             }
             
-            if (i % 20 === 0 && i > 0) setLoadingMsg(`Fetching quotes... ${Math.min(i + batchSize, usTickers.length)}/${usTickers.length}`);
+            // Update progress every 10 stocks
+            if (i % 10 === 0) setLoadingMsg(`Fetching live quotes (${i}/${usTickers.length})...`);
             
-            // Small delay between batches to be polite to the API
-            if (i + batchSize < usTickers.length) await new Promise(r => setTimeout(r, 200));
-          } catch (batchErr) {
-            // If batch of 5 fails with 402, try one at a time
-            if (batchErr.message.includes("402")) {
-              for (const singleTicker of batch) {
-                try {
-                  const sRes = await fetch(`${FMP_BASE}/quote?symbol=${singleTicker}&apikey=${FMP_API_KEY}`);
-                  if (sRes.ok) {
-                    const sData = await sRes.json();
-                    callsUsed++;
-                    if (Array.isArray(sData) && sData.length > 0) allQuotes.push(sData[0]);
-                    else if (sData && sData.symbol) allQuotes.push(sData);
-                  }
-                  await new Promise(r => setTimeout(r, 150));
-                } catch {}
-              }
-            }
-            diagLog.push("⚠ Batch " + (i / batchSize + 1) + " issue: " + batchErr.message);
+            // Small delay to be polite (100ms between calls)
+            if (i < usTickers.length - 1) await new Promise(r => setTimeout(r, 100));
+            
+          } catch (err) {
+            fetchErrors.push(ticker + ":" + (err.name === "AbortError" ? "timeout" : err.message.slice(0, 20)));
           }
         }
         
-        if (allQuotes.length === 0) throw new Error("No quotes received — API may restrict free tier");
+        if (allQuotes.length === 0) throw new Error("No quotes received — check API key and plan");
         
-        diagLog.push("✓ Received " + allQuotes.length + " quotes (" + callsUsed + " API calls)");
-        setLoadingMsg("Received " + allQuotes.length + " live quotes — building screener...");
+        // Log results
+        if (skippedFromCache > 0) diagLog.push("✓ " + skippedFromCache + " quotes from cache (0 API calls)");
+        diagLog.push("✓ " + (allQuotes.length - skippedFromCache) + " fresh quotes fetched (" + callsUsed + " API calls)");
+        diagLog.push("✓ Total: " + allQuotes.length + " live quotes");
+        if (fetchErrors.length > 0) diagLog.push("⚠ " + fetchErrors.length + " tickers failed: " + fetchErrors.slice(0, 5).join(", ") + (fetchErrors.length > 5 ? "..." : ""));
+        diagLog.push("ℹ Quotes cached for 1hr — next refresh uses 0 calls");
+        setLoadingMsg("Got " + allQuotes.length + " live quotes — building screener...");
         
         const quotes = {};
         allQuotes.forEach(q => { if (q.symbol) quotes[q.symbol] = q; });
