@@ -22,7 +22,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 // ── FREE API CONFIG ──
 // Users: Get your free key at https://financialmodelingprep.com/developer/docs/
 const FMP_API_KEY = import.meta.env.VITE_FMP_API_KEY || "demo";
-const FMP_BASE = "https://financialmodelingprep.com/api/v3";
+const FMP_BASE = "https://financialmodelingprep.com/stable";
 
 const TOP_100_TICKERS = [
   "AAPL","MSFT","NVDA","AMZN","GOOG","META","BRK-B","LLY","AVGO","JPM",
@@ -73,21 +73,21 @@ async function fetchWithCache(url, cacheKey, ttlMs = 300000) {
   }
 }
 
-// Batch quote fetch (1 API call for all 100 stocks)
+// Batch quote fetch — new stable API uses ?symbol= with comma-separated tickers
 async function fetchBulkQuotes(tickers) {
-  const url = `${FMP_BASE}/quote/${tickers.join(",")}?apikey=${FMP_API_KEY}`;
+  const url = `${FMP_BASE}/batch-quote?symbol=${tickers.join(",")}&apikey=${FMP_API_KEY}`;
   return fetchWithCache(url, "bulk_quotes", 60000);
 }
 
-// Historical prices (per ticker, cached 30 min)
+// Historical prices — new stable endpoint
 async function fetchHistoricalPrices(ticker) {
-  const url = `${FMP_BASE}/historical-price-full/${ticker}?timeseries=250&apikey=${FMP_API_KEY}`;
+  const url = `${FMP_BASE}/historical-price-eod/full?symbol=${ticker}&apikey=${FMP_API_KEY}`;
   return fetchWithCache(url, `hist_${ticker}`, 1800000);
 }
 
-// Key metrics (per ticker, cached 1 hour)
+// Key metrics — new stable endpoint
 async function fetchKeyMetrics(ticker) {
-  const url = `${FMP_BASE}/key-metrics-ttm/${ticker}?apikey=${FMP_API_KEY}`;
+  const url = `${FMP_BASE}/key-metrics?symbol=${ticker}&period=ttm&apikey=${FMP_API_KEY}`;
   return fetchWithCache(url, `metrics_${ticker}`, 3600000);
 }
 
@@ -520,7 +520,7 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const result = localStorage.getItem("alpha_watchlist");
+        const result = await window.storage.get("watchlist");
         if (result?.value) setWatchlist(new Set(JSON.parse(result.value)));
       } catch (e) { /* No stored watchlist yet */ }
     })();
@@ -532,7 +532,7 @@ export default function App() {
       const next = new Set(prev);
       if (next.has(ticker)) next.delete(ticker); else next.add(ticker);
       // Persist
-      try { localStorage.setItem("alpha_watchlist", JSON.stringify([...next])); } catch (e) {}
+      try { window.storage.set("watchlist", JSON.stringify([...next])); } catch (e) {}
       return next;
     });
   }, []);
@@ -600,7 +600,7 @@ export default function App() {
 
         // TIER 1: Single bulk quote — 1 API call for all 100 stocks
         const usTickers = TOP_100_TICKERS.filter(t => !t.includes(".TO"));
-        const quoteUrl = `${FMP_BASE}/quote/${usTickers.join(",")}?apikey=${FMP_API_KEY}`;
+        const quoteUrl = `${FMP_BASE}/batch-quote?symbol=${usTickers.join(",")}&apikey=${FMP_API_KEY}`;
         
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 12000);
@@ -745,7 +745,7 @@ export default function App() {
       let newCalls = 0;
 
       if (!hist) {
-        const hRes = await fetch(`${FMP_BASE}/historical-price-full/${cleanTicker}?timeseries=250&apikey=${FMP_API_KEY}`);
+        const hRes = await fetch(`${FMP_BASE}/historical-price-eod/full?symbol=${cleanTicker}&apikey=${FMP_API_KEY}`);
         if (hRes.ok) {
           const hData = await hRes.json();
           if (hData.historical) { hist = hData.historical; setCache("hist_" + cleanTicker, hist); }
@@ -754,7 +754,7 @@ export default function App() {
       }
 
       if (!metrics) {
-        const mRes = await fetch(`${FMP_BASE}/key-metrics-ttm/${cleanTicker}?apikey=${FMP_API_KEY}`);
+        const mRes = await fetch(`${FMP_BASE}/key-metrics?symbol=${cleanTicker}&period=ttm&apikey=${FMP_API_KEY}`);
         if (mRes.ok) {
           const mData = await mRes.json();
           if (Array.isArray(mData) && mData.length > 0) { metrics = mData[0]; setCache("metrics_" + cleanTicker, metrics); }
