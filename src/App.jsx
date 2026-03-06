@@ -538,38 +538,30 @@ export default function App() {
   }, []);
 
   // ══════════════════════════════════════════════════════════════
-  // API BUDGET STRATEGY (Gemini was right — 250 calls/day needs planning)
+  // API BUDGET STRATEGY v3.2 (adapted for FMP stable free tier)
   //
-  // Budget: 250 calls/day
+  // FMP free tier: 250 calls/day, /stable/ endpoints only
+  // /batch-quote returns 402 (paid only) — use /quote per stock
   //
-  // TIER 1 — Bulk Quote (1 call, all 100 stocks)
-  //   FMP's /quote/AAPL,MSFT,... endpoint accepts comma-separated tickers
-  //   Returns: price, PE, marketCap, volume, dayHigh/Low, yearHigh/Low,
-  //            priceAvg50, priceAvg200, eps, sharesOutstanding
-  //   This is enough for: current price, PE, market cap, basic trend
-  //   Cost: 1 API call ← this is the core screener data
+  // TIER 1 — Quotes (first load): ~16-80 calls
+  //   /stable/quote?symbol=AAPL,MSFT,NVDA,AMZN,GOOG (5 per call)
+  //   80 US stocks ÷ 5 per call = 16 calls
+  //   Falls back to 1-per-call if batching fails = 80 calls
+  //   Cached in memory (2 min TTL)
   //
-  // TIER 2 — Historical Prices (1 call per stock, ON-DEMAND only)
-  //   Only fetched when user CLICKS a stock to see detailed analysis
-  //   Cached in localStorage for 24h so it doesn't re-fetch
-  //   Cost: 1 call per click, max ~20-30 per session realistically
+  // TIER 2 — Historical (on-demand): 1 call per click
+  //   /stable/historical-price-eod/full?symbol=AAPL
+  //   Cached in localStorage for 24h
   //
-  // TIER 3 — Key Metrics (1 call per stock, ON-DEMAND only)
-  //   Full fundamentals: ROE, D/E, FCF yield, profit margin, etc.
-  //   Only fetched alongside historical when user clicks a stock
-  //   Cost: 1 call per click
+  // TIER 3 — Metrics (on-demand): 1 call per click
+  //   /stable/key-metrics?symbol=AAPL&period=ttm
+  //   Cached in localStorage for 24h
   //
   // DAILY BUDGET:
-  //   First load:     1 call  (bulk quote)
-  //   Each refresh:   1 call  (bulk quote, cached 2 min)
-  //   Each stock click: 0-2 calls (historical + metrics, cached 24h)
-  //   Typical day:    1 + 10 refreshes + 30 stock clicks × 2 = ~71 calls
-  //   Worst case:     1 + 50 refreshes + 100 clicks × 2 = ~251 calls
-  //
-  // vs OLD architecture: 201 calls on FIRST LOAD alone
-  //
-  // CACHING: localStorage with 24h TTL for historical/metrics,
-  //          2-min TTL for quotes (in-memory)
+  //   First load:     ~16-80 calls (depends on batching support)
+  //   Each refresh:   0 calls (cached 2 min) or ~16-80 if cache expired
+  //   Stock click:    0-2 calls (cached 24h)
+  //   Safe daily:     ~100-150 calls typical
   // ══════════════════════════════════════════════════════════════
 
   // Persistent cache helpers (survive page refresh)
@@ -598,29 +590,68 @@ export default function App() {
         setLoadingMsg("Testing API connection...");
         diagLog.push("Key: " + FMP_API_KEY.slice(0, 4) + "***");
 
-        // TIER 1: Single bulk quote — 1 API call for all 100 stocks
+        // TIER 1: Use /stable/quote for individual stocks (free tier compatible)
+        // Fetch in groups of 5 with small delays to avoid rate limits
+        // Total: ~20 calls for 100 stocks (5 per call) — well within 250/day
         const usTickers = TOP_100_TICKERS.filter(t => !t.includes(".TO"));
-        const quoteUrl = `${FMP_BASE}/batch-quote?symbol=${usTickers.join(",")}&apikey=${FMP_API_KEY}`;
+        const batchSize = 5;
+        const allQuotes = [];
         
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 12000);
-        const res = await fetch(quoteUrl, { signal: controller.signal });
-        clearTimeout(timeout);
-        
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const quoteData = await res.json();
-        callsUsed++;
-        
-        if (!Array.isArray(quoteData) || quoteData.length === 0) {
-          if (quoteData["Error Message"]) throw new Error(quoteData["Error Message"]);
-          throw new Error("Empty response");
+        for (let i = 0; i < usTickers.length; i += batchSize) {
+          const batch = usTickers.slice(i, i + batchSize);
+          const quoteUrl = `${FMP_BASE}/quote?symbol=${batch.join(",")}&apikey=${FMP_API_KEY}`;
+          
+          try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 10000);
+            const res = await fetch(quoteUrl, { signal: controller.signal });
+            clearTimeout(timeout);
+            
+            if (!res.ok) {
+              if (res.status === 402) throw new Error("402: Endpoint requires paid plan — trying single quotes...");
+              throw new Error(`HTTP ${res.status}`);
+            }
+            
+            const data = await res.json();
+            callsUsed++;
+            
+            if (Array.isArray(data)) {
+              allQuotes.push(...data);
+            } else if (data && data.symbol) {
+              allQuotes.push(data);
+            }
+            
+            if (i % 20 === 0 && i > 0) setLoadingMsg(`Fetching quotes... ${Math.min(i + batchSize, usTickers.length)}/${usTickers.length}`);
+            
+            // Small delay between batches to be polite to the API
+            if (i + batchSize < usTickers.length) await new Promise(r => setTimeout(r, 200));
+          } catch (batchErr) {
+            // If batch of 5 fails with 402, try one at a time
+            if (batchErr.message.includes("402")) {
+              for (const singleTicker of batch) {
+                try {
+                  const sRes = await fetch(`${FMP_BASE}/quote?symbol=${singleTicker}&apikey=${FMP_API_KEY}`);
+                  if (sRes.ok) {
+                    const sData = await sRes.json();
+                    callsUsed++;
+                    if (Array.isArray(sData) && sData.length > 0) allQuotes.push(sData[0]);
+                    else if (sData && sData.symbol) allQuotes.push(sData);
+                  }
+                  await new Promise(r => setTimeout(r, 150));
+                } catch {}
+              }
+            }
+            diagLog.push("⚠ Batch " + (i / batchSize + 1) + " issue: " + batchErr.message);
+          }
         }
-
-        diagLog.push("✓ Bulk quote: " + quoteData.length + " stocks (1 API call)");
-        setLoadingMsg("Received " + quoteData.length + " live quotes — building screener...");
+        
+        if (allQuotes.length === 0) throw new Error("No quotes received — API may restrict free tier");
+        
+        diagLog.push("✓ Received " + allQuotes.length + " quotes (" + callsUsed + " API calls)");
+        setLoadingMsg("Received " + allQuotes.length + " live quotes — building screener...");
         
         const quotes = {};
-        quoteData.forEach(q => { if (q.symbol) quotes[q.symbol] = q; });
+        allQuotes.forEach(q => { if (q.symbol) quotes[q.symbol] = q; });
 
         // Build stock data using quote data + simulated history
         // (Historical will be fetched on-demand when user clicks)
